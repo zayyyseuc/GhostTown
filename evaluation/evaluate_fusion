@@ -1,0 +1,236 @@
+# -*- coding: utf-8 -*-
+import os
+import random
+import numpy as np
+import tensorflow as tf
+from keras.models import load_model
+from keras.preprocessing import image as kimage
+from PIL import Image
+import matplotlib.pyplot as plt
+import seaborn as sns
+from sklearn.metrics import confusion_matrix, classification_report
+from tqdm import tqdm
+
+# ================= 配置区 =================
+# 数据集路径
+DATASET_AUDIO = r"E:/CityML/dataset_sound"
+DATASET_IMAGE = r"E:/CityML/dataset_opencv"
+
+# 模型路径
+AUDIO_MODEL_PATH = 'best_audio_model.keras'
+IMAGE_MODEL_PATH = 'best_image_model_v2.keras'
+
+# 类别定义 (必须与训练时一致)
+CLASS_NAMES = ['A1', 'A2', 'B1', 'B2', 'C1', 'C2']
+
+# 融合权重
+AUDIO_WEIGHT = 0.5
+IMAGE_WEIGHT = 0.5
+
+# 图像目标尺寸 (宽, 高) - PIL使用 (Width, Height)
+# 对应 training.py 中的 (240, 320) (Height, Width)
+IMG_SIZE_PIL = (320, 240)  
+
+# ================= 1. 预处理函数 =================
+
+def process_audio(file_path):
+    """
+    音频预处理逻辑
+    """
+    try:
+        # 1. 读取与解码
+        audio_binary = tf.io.read_file(file_path)
+        audio, sample_rate = tf.audio.decode_wav(audio_binary, desired_channels=1)
+        audio = tf.squeeze(audio, axis=-1)
+        
+        # 2. 填充或截断 (目标长度 4秒 * 16000)
+        target_length = 16000 * 4
+        current_length = tf.shape(audio)[0]
+        audio = audio[:target_length]
+        pad_length = tf.maximum(target_length - current_length, 0)
+        audio = tf.pad(audio, [[0, pad_length]])
+        
+        # 3. STFT 变换
+        stfts = tf.signal.stft(audio, frame_length=1024, frame_step=512, fft_length=1024)
+        spectrogram = tf.abs(stfts)
+        
+        # 4. Mel 频谱转换
+        mel_matrix = tf.signal.linear_to_mel_weight_matrix(
+            num_mel_bins=128, num_spectrogram_bins=513, sample_rate=16000,
+            lower_edge_hertz=80.0, upper_edge_hertz=7600.0)
+        
+        mel_spectrogram = tf.tensordot(spectrogram, mel_matrix, 1)
+        log_mel = tf.math.log(mel_spectrogram + 1e-6)
+        
+        # 5. 归一化
+        mean, variance = tf.nn.moments(log_mel, axes=[0, 1]) 
+        normalized = (log_mel - mean) / tf.sqrt(variance + 1e-6)
+        
+        # 6. 增加维度 (Batch, Time, Freq, Channel)
+        input_tensor = tf.expand_dims(normalized, axis=0)
+        input_tensor = tf.expand_dims(input_tensor, axis=-1)
+        
+        return input_tensor
+    except Exception as e:
+        print(f"音频处理错误: {e}")
+        return None
+
+def process_image(img_path):
+    """
+    【修正版】图像预处理逻辑
+    必须严格匹配 training.py 的处理方式：
+    1. Resize 到 (240, 320)
+    2. 归一化到 [-1, 1] 区间
+    """
+    try:
+        # 1. 打开并转RGB
+        img = Image.open(img_path).convert('RGB')
+        
+        # 2. 缩放 (PIL使用 W, H)
+        img = img.resize(IMG_SIZE_PIL, Image.Resampling.BILINEAR)
+        
+        # 3. 转数组
+        img_array = kimage.img_to_array(img)
+        
+        # 4. 【关键修正】归一化流程
+        # training.py 逻辑: img = (img - 0.5) * 2.0
+        # 这里的 img 在 training.py 是由 tf.image.convert_image_dtype 生成的 [0,1] 浮点数
+        
+        # 第一步：转为 0~1 范围
+        img_array = img_array / 255.0
+        
+        # 第二步：转为 -1~1 范围 (与训练代码保持数学一致性)
+        img_array = (img_array - 0.5) * 2.0
+        
+        # 5. 增加 Batch 维度
+        img_array = np.expand_dims(img_array, axis=0)
+        
+        return img_array
+    except Exception as e:
+        print(f"图像处理错误: {e}")
+        return None
+
+# ================= 2. 辅助函数 =================
+
+def load_models():
+    print(">>> 正在加载模型...")
+    try:
+        # 如果只想测图像，可以注释掉音频加载以节省内存，或者保持原样
+        audio_model = load_model(AUDIO_MODEL_PATH)
+        image_model = load_model(IMAGE_MODEL_PATH)
+        print(">>> 模型加载成功！")
+        return audio_model, image_model
+    except Exception as e:
+        print(f"模型加载失败，请检查文件是否存在: {e}")
+        return None, None
+
+def get_random_sample(class_name, modality='audio'):
+    """从指定类别的文件夹中随机抽取一个文件"""
+    root = DATASET_AUDIO if modality == 'audio' else DATASET_IMAGE
+    folder = os.path.join(root, f"{class_name}_samples", modality)
+    
+    # 兼容大小写差异 (Sample vs sample)
+    if not os.path.exists(folder):
+        folder = os.path.join(root, f"{class_name}_Samples", modality)
+        if not os.path.exists(folder):
+            # 再次尝试不带 modality 子文件夹的情况 (适配部分数据集结构)
+            folder = os.path.join(root, f"{class_name}_samples")
+            if not os.path.exists(folder):
+                 return None
+
+    # 过滤文件扩展名
+    exts = ('.wav') if modality == 'audio' else ('.jpg', '.jpeg', '.png')
+    files = [f for f in os.listdir(folder) if f.lower().endswith(exts)]
+    
+    if not files: return None
+    return os.path.join(folder, random.choice(files))
+
+# ================= 3. 主测试逻辑 =================
+
+def run_evaluation(num_samples_per_class=50):
+    audio_model, image_model = load_models()
+    if not image_model: 
+        print("错误：未加载到图像模型！")
+        return
+    
+    y_true = []
+    y_pred = []
+    
+    print(f"\n开始多模态融合测试 (每类测试 {num_samples_per_class} 组样本)...")
+    print(f"融合策略: Soft Voting (Audio * {AUDIO_WEIGHT} + Image * {IMAGE_WEIGHT})")
+    
+    for true_label_str in CLASS_NAMES:
+        print(f"正在测试类别: {true_label_str} ...")
+        
+        # 使用 tqdm 显示进度条
+        for _ in tqdm(range(num_samples_per_class), desc=f"Testing {true_label_str}"):
+            # 1. 获取文件路径
+            img_path = get_random_sample(true_label_str, 'image')
+            
+            # 如果只测图像，音频路径可以是None，或者为了代码健壮性也获取一下
+            audio_path = get_random_sample(true_label_str, 'audio') 
+            
+            # 如果缺少图像文件，跳过
+            if not img_path:
+                continue
+            
+            # 2. 图像预测
+            img_tensor = process_image(img_path)
+            if img_tensor is None: continue
+            image_probs = image_model.predict(img_tensor, verbose=0)[0]
+            
+            # 3. 音频预测 (仅当权重 > 0 时才进行，节省时间)
+            if AUDIO_WEIGHT > 0 and audio_path and audio_model:
+                audio_tensor = process_audio(audio_path)
+                if audio_tensor is not None:
+                    audio_probs = audio_model.predict(audio_tensor, verbose=0)[0]
+                else:
+                    # 如果音频读取失败，回退到纯图像概率 (或设为均等概率)
+                    audio_probs = np.zeros_like(image_probs)
+            else:
+                audio_probs = np.zeros_like(image_probs)
+            
+            # 4. 加权融合
+            fusion_probs = (audio_probs * AUDIO_WEIGHT) + (image_probs * IMAGE_WEIGHT)
+            
+            # 5. 获取结果
+            pred_idx = np.argmax(fusion_probs)
+            pred_label_str = CLASS_NAMES[pred_idx]
+            
+            y_true.append(true_label_str)
+            y_pred.append(pred_label_str)
+
+    # ================= 4. 结果可视化 =================
+    
+    print("\n" + "="*60)
+    print("评估报告")
+    print("="*60)
+    
+    if len(y_true) == 0:
+        print("未找到任何有效样本进行测试。")
+        return
+
+    # 打印详细指标
+    print(classification_report(y_true, y_pred, target_names=CLASS_NAMES, digits=4))
+    
+    # 绘制混淆矩阵
+    cm = confusion_matrix(y_true, y_pred, labels=CLASS_NAMES)
+    plt.figure(figsize=(10, 8))
+    sns.heatmap(cm, annot=True, fmt='d', cmap='Blues',
+                xticklabels=CLASS_NAMES, yticklabels=CLASS_NAMES)
+    plt.xlabel('Predicted Label')
+    plt.ylabel('True Label')
+    plt.title(f'Confusion Matrix (A={AUDIO_WEIGHT}, I={IMAGE_WEIGHT})')
+    
+    save_path = "fusion_confusion_matrix.png"
+    plt.savefig(save_path)
+    print(f"混淆矩阵已保存: {save_path}")
+    plt.show()
+
+if __name__ == "__main__":
+    # 显存按需分配
+    physical_devices = tf.config.list_physical_devices('GPU')
+    if len(physical_devices) > 0:
+        tf.config.experimental.set_memory_growth(physical_devices[0], True)
+        
+    run_evaluation()
