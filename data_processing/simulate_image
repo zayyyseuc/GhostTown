@@ -1,0 +1,132 @@
+# -*- coding: utf-8 -*-
+import os
+import numpy as np
+from PIL import Image
+from tqdm import tqdm
+import random
+import shutil
+
+# ================= 配置区 =================
+# 1. Cityscapes 路径
+CITYSCAPES_ROOT = r"E:/CityML/cityscape"
+
+# 2. 目标路径
+TARGET_DATASET_PATH = r"E:/CityML/dataset_opencv"
+
+# 3. 每类最大样本数限制
+#    防止 B2(普通街道) 抢占太多资源，造成数据不平衡
+MAX_SAMPLES_PER_CLASS = 400 
+
+# 4. 目标尺寸
+TARGET_SIZE = (320, 240)
+
+# ================= 智能分类逻辑 =================
+# Cityscapes Label IDs
+ID_PEDESTRIAN = [24, 25]        # 人
+ID_VEHICLE = [26, 27, 28, 31, 32, 33] # 车
+ID_NATURE = [21, 22]            # 自然
+ID_BUILDING = [11, 12, 13]      # 建筑
+
+def analyze_scene(mask_path):
+    try:
+        mask = Image.open(mask_path)
+        mask_arr = np.array(mask)
+        total_pixels = mask_arr.size
+        
+        ratio_pedestrian = np.isin(mask_arr, ID_PEDESTRIAN).sum() / total_pixels
+        ratio_vehicle = np.isin(mask_arr, ID_VEHICLE).sum() / total_pixels
+        ratio_nature = np.isin(mask_arr, ID_NATURE).sum() / total_pixels
+        ratio_building = np.isin(mask_arr, ID_BUILDING).sum() / total_pixels
+        
+        ratio_vitality = ratio_pedestrian + ratio_vehicle
+        
+        return ratio_vitality, ratio_pedestrian, ratio_vehicle, ratio_nature, ratio_building
+    except:
+        return None
+
+def process_cityscapes():
+    print("="*50)
+    print(f"源目录: {CITYSCAPES_ROOT}")
+    print(f"模式: 均衡采样 (每类上限 {MAX_SAMPLES_PER_CLASS} 张)")
+    print("="*50)
+    
+    # 自动清理旧数据 (可选，防止旧的 1500 张 B2 还在里面干扰)
+    if os.path.exists(TARGET_DATASET_PATH):
+        print("正在清理旧数据文件夹...")
+        shutil.rmtree(TARGET_DATASET_PATH)
+    
+    img_root = os.path.join(CITYSCAPES_ROOT, "leftImg8bit", "train")
+    mask_root = os.path.join(CITYSCAPES_ROOT, "gtFine", "train")
+    
+    if not os.path.exists(img_root):
+        print(f"错误：找不到 {img_root}")
+        return
+
+    # 统计计数器
+    stats = {'A1':0, 'A2':0, 'B1':0, 'B2':0, 'C1':0, 'C2':0}
+    
+    cities = os.listdir(img_root)
+    # 打乱城市顺序，防止只采到某一个城市的图
+    random.shuffle(cities)
+    
+    for city in tqdm(cities, desc="处理进度"):
+        city_img_dir = os.path.join(img_root, city)
+        city_mask_dir = os.path.join(mask_root, city)
+        
+        if not os.path.isdir(city_img_dir): continue
+        
+        files = os.listdir(city_img_dir)
+        random.shuffle(files) # 打乱图片顺序，随机采样
+        
+        for f in files:
+            if f.endswith("_leftImg8bit.png"):
+                # 如果所有类别都满了，提前结束
+                if all(v >= MAX_SAMPLES_PER_CLASS for v in stats.values()):
+                    break
+                
+                base_name = f.replace("_leftImg8bit.png", "")
+                mask_name = f"{base_name}_gtFine_labelIds.png"
+                src_img_path = os.path.join(city_img_dir, f)
+                src_mask_path = os.path.join(city_mask_dir, mask_name)
+                
+                if not os.path.exists(src_mask_path): continue
+
+                # 分析
+                result = analyze_scene(src_mask_path)
+                if not result: continue
+                vitality, ped, veh, nature, build = result
+                
+                target_label = None
+                
+                # === 分类逻辑 (微调版) ===
+                if vitality < 0.01:
+                    if nature > build: target_label = 'A2'
+                    else: target_label = 'A1'
+                elif 0.01 <= vitality < 0.15:
+                    if build > 0.45: target_label = 'B1' # 门槛稍降，多抓点B1
+                    else: target_label = 'B2'
+                else:
+                    # 只要有人，尽量算C1 (因为车太多了，C2很容易满)
+                    if ped > 0.01: target_label = 'C1'
+                    else: target_label = 'C2'
+                
+                # === 关键：配额检查 ===
+                if target_label and stats[target_label] < MAX_SAMPLES_PER_CLASS:
+                    target_dir = os.path.join(TARGET_DATASET_PATH, f"{target_label}_samples", "image")
+                    os.makedirs(target_dir, exist_ok=True)
+                    
+                    save_path = os.path.join(target_dir, f"{base_name}.jpg")
+                    try:
+                        with Image.open(src_img_path) as img:
+                            img.resize(TARGET_SIZE, Image.Resampling.BILINEAR).convert('RGB').save(save_path, quality=90)
+                        stats[target_label] += 1
+                    except: pass
+
+    print("="*50)
+    print("采样完成！最终各类别数量：")
+    for k, v in stats.items():
+        print(f"  - {k}: {v} 张")
+    print("-" * 50)
+
+if __name__ == "__main__":
+    process_cityscapes()
