@@ -1,0 +1,571 @@
+# -*- coding: utf-8 -*-
+# =====================
+# Import Libraries
+# =====================
+import os
+import io
+import numpy as np
+import tensorflow as tf
+import serial
+import wave
+import time
+import sys
+import requests
+import cv2
+import matplotlib.pyplot as plt
+from datetime import datetime
+from PIL import Image
+from keras.models import load_model
+from keras.preprocessing import image as kimage
+import logging
+from typing import Optional, Tuple, List
+
+# =====================
+# Configuration (Autofilled from your file)
+# =====================
+# ✅ 1. Path Config (E: Drive)
+SAVE_ROOT = "E:/CityML/RegionClassification"
+
+AUDIO_SAVE_DIR = os.path.join(SAVE_ROOT, "Audio")
+IMAGE_SAVE_DIR = os.path.join(SAVE_ROOT, "Images")
+LOG_SAVE_DIR = os.path.join(SAVE_ROOT, "SystemLogs")
+VISUALIZATION_DIR = os.path.join(SAVE_ROOT, "Results")
+
+# Create directories
+os.makedirs(AUDIO_SAVE_DIR, exist_ok=True)
+os.makedirs(IMAGE_SAVE_DIR, exist_ok=True)
+os.makedirs(LOG_SAVE_DIR, exist_ok=True)
+os.makedirs(VISUALIZATION_DIR, exist_ok=True)
+
+# ✅ 2. Hardware Config (Based on your uploaded file)
+RECORD_PORT = 'COM8'        # STM32 Mic Port (修改这里)
+RECORD_BAUD = 2000000       # STM32 Baud (修改这里)
+TFT_PORT = 'COM3'           # Arduino TFT Port
+TFT_BAUD = 115200           # Arduino Baud
+ESP32_IP = "192.168.101.84" # ESP32 IP
+
+# 3. Model & Data Config
+AUDIO_MODEL_PATH = 'best_audio_model.keras'
+IMAGE_MODEL_PATH = 'best_image_model.keras'
+RECORD_CHUNK_SAMPLES = 1024
+RECORD_DURATION = 5
+IMG_SIZE = (240, 320)
+TFT_WIDTH = 128
+TFT_HEIGHT = 128
+RETRY_TIMES = 3
+
+# Class Names
+AUDIO_CLASS_NAMES = ['A1', 'A2', 'B1', 'B2', 'C1', 'C2']
+CLASS_NAMES = ['A1', 'A2', 'B1', 'B2', 'C1', 'C2']
+
+# Fusion Weights
+AUDIO_WEIGHT = 0.6
+IMAGE_WEIGHT = 0.4
+
+# =====================
+# Logging Setup
+# =====================
+def setup_logging():
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+        handlers=[
+            logging.StreamHandler(sys.stdout),
+            logging.FileHandler(os.path.join(LOG_SAVE_DIR, 'system.log'))
+        ]
+    )
+    return logging.getLogger('SmartGuide')
+
+logger = setup_logging()
+
+# =====================
+# TFT Display Controller
+# =====================
+class TFTDisplayController:
+    def __init__(self, port: str = TFT_PORT, baudrate: int = TFT_BAUD, 
+                 width: int = TFT_WIDTH, height: int = TFT_HEIGHT):
+        self.port = port
+        self.baudrate = baudrate
+        self.width = width
+        self.height = height
+        self.serial_conn = None
+        self.max_retries = 3
+        
+    def connect(self, timeout: float = 5.0) -> bool:
+        try:
+            self.serial_conn = serial.Serial(
+                port=self.port,
+                baudrate=self.baudrate,
+                timeout=2,
+                write_timeout=2,
+                inter_byte_timeout=0.1
+            )
+            self.serial_conn.reset_input_buffer()
+            
+            logger.info(f"Connecting to TFT on {self.port}...")
+            start_time = time.time()
+            while time.time() - start_time < timeout:
+                if self.serial_conn.in_waiting > 0:
+                    raw_data = self.serial_conn.readline()
+                    try:
+                        response = raw_data.decode('ascii', errors='ignore').strip()
+                        if "READY" in response:
+                            logger.info("TFT Display Connected (READY received)!")
+                            return True
+                    except:
+                        continue
+            
+            logger.warning("TFT Connection: No READY signal (Please press RESET on Arduino)")
+            return False
+            
+        except Exception as e:
+            logger.error(f"TFT Connection failed: {str(e)}")
+            return False
+    
+    def send_image(self, image_path: str) -> bool:
+        if not os.path.exists(image_path):
+            return False
+            
+        for attempt in range(self.max_retries):
+            try:
+                # Open and resize
+                img = Image.open(image_path).convert('RGB')
+                img = img.resize((self.width, self.height))
+                
+                # Handshake: Start
+                self.serial_conn.write(b'\xFF')
+                time.sleep(0.1)
+                
+                # Send pixels line by line
+                pixels = img.load()
+                for y in range(self.height):
+                    line_data = bytearray()
+                    for x in range(self.width):
+                        r, g, b = pixels[x, y]
+                        # RGB888 to RGB565
+                        color = ((r & 0xF8) << 8) | ((g & 0xFC) << 3) | (b >> 3)
+                        line_data.extend([color >> 8, color & 0xFF])
+                    
+                    self.serial_conn.write(line_data)
+                    time.sleep(0.005) # Small delay to prevent buffer overflow
+                
+                # Handshake: End (Wait for OK)
+                start_time = time.time()
+                while time.time() - start_time < 2:
+                    if self.serial_conn.in_waiting > 0:
+                        response = self.serial_conn.readline().decode('ascii', errors='ignore').strip()
+                        if "OK" in response:
+                            return True
+                
+                time.sleep(0.5)
+                
+            except Exception as e:
+                logger.error(f"Error sending image: {str(e)}")
+                time.sleep(1)
+        return False
+    
+    def close(self) -> None:
+        if self.serial_conn and self.serial_conn.is_open:
+            try:
+                self.serial_conn.close()
+            except:
+                pass
+
+# =====================
+# Visualization Helpers (English Only)
+# =====================
+def plot_audio_waveform(audio_data: np.ndarray, sample_rate: int, save_path: Optional[str] = None):
+    plt.figure(figsize=(10, 4))
+    time_axis = np.linspace(0, len(audio_data)/sample_rate, num=len(audio_data))
+    plt.plot(time_axis, audio_data)
+    plt.title('Audio Waveform')
+    plt.xlabel('Time (s)')
+    plt.ylabel('Amplitude')
+    plt.grid(True)
+    if save_path:
+        plt.savefig(save_path, dpi=300, bbox_inches='tight')
+        plt.close()
+
+def plot_spectrogram(spectrogram: np.ndarray, save_path: Optional[str] = None):
+    plt.figure(figsize=(10, 4))
+    plt.imshow(spectrogram, aspect='auto', origin='lower', cmap='viridis')
+    plt.title('Spectrogram')
+    plt.xlabel('Time Frames')
+    plt.ylabel('Frequency Bins')
+    plt.colorbar(format='%+2.0f dB')
+    if save_path:
+        plt.savefig(save_path, dpi=300, bbox_inches='tight')
+        plt.close()
+
+def plot_class_probabilities(class_names: List[str], probabilities: np.ndarray, title: str, save_path: Optional[str] = None):
+    plt.figure(figsize=(12, 6))
+    bars = plt.bar(class_names, probabilities, color='skyblue')
+    plt.title(title)
+    plt.xlabel('Class')
+    plt.ylabel('Probability (%)')
+    plt.xticks(rotation=45)
+    plt.ylim(0, 100)
+    for bar in bars:
+        height = bar.get_height()
+        plt.text(bar.get_x() + bar.get_width()/2., height, f'{height:.1f}%', ha='center', va='bottom', fontsize=9)
+    if save_path:
+        plt.savefig(save_path, dpi=300, bbox_inches='tight')
+        plt.close()
+
+def create_result_dashboard(audio_class, audio_conf, image_class, image_conf, final_result, save_path=None):
+    fig = plt.figure(figsize=(8, 4))
+    plt.title(f'Final Result: {final_result}', fontsize=14, fontweight='bold')
+    
+    text_content = ""
+    if audio_class and image_class:
+        if audio_class != image_class:
+            text_content = (
+                f"Audio: {audio_class} (Conf: {audio_conf:.1f}%, W: {AUDIO_WEIGHT*100}%)\n"
+                f"Image: {image_class} (Conf: {image_conf:.1f}%, W: {IMAGE_WEIGHT*100}%)\n"
+                f"Score: Audio={audio_conf*AUDIO_WEIGHT:.1f}, Image={image_conf*IMAGE_WEIGHT:.1f}"
+            )
+        else:
+            text_content = f"Consensus: {final_result}"
+    elif audio_class:
+        text_content = f"Audio Only: {audio_class} ({audio_conf:.1f}%)"
+    elif image_class:
+        text_content = f"Image Only: {image_class} ({image_conf:.1f}%)"
+    else:
+        text_content = "Analysis Failed"
+    
+    plt.text(0.5, 0.5, text_content, ha='center', va='center', fontsize=12)
+    plt.axis('off')
+    if save_path:
+        plt.savefig(save_path, dpi=300, bbox_inches='tight')
+        plt.close()
+
+# =====================
+# Core Functions
+# =====================
+def record_audio(duration: int = RECORD_DURATION) -> Optional[str]:
+    filename = os.path.join(AUDIO_SAVE_DIR, f"audio_{int(time.time())}.wav")
+    end_time = time.time() + duration
+    
+    try:
+        ser = serial.Serial(RECORD_PORT, RECORD_BAUD, timeout=2)
+        logger.info(f"Connected to Mic on {ser.port}")
+    except serial.SerialException as e:
+        logger.error(f"Mic connection failed: {e}")
+        return None
+    
+    try:
+        with wave.open(filename, 'wb') as wf:
+            wf.setnchannels(1)
+            wf.setsampwidth(2)
+            wf.setframerate(16000)
+            
+            logger.info(f"Recording for {duration}s...")
+            start_time = time.time()
+            audio_data = []
+            
+            while time.time() < end_time:
+                bytes_needed = RECORD_CHUNK_SAMPLES * 2
+                data = ser.read(bytes_needed)
+                if len(data) != bytes_needed: continue
+                
+                wf.writeframes(data)
+                samples = np.frombuffer(data, dtype=np.int16)
+                audio_data.extend(samples)
+                
+                elapsed = time.time() - start_time
+                percent = min(100, elapsed / duration * 100)
+                sys.stdout.write(f"\rProgress: {percent:.1f}%")
+                sys.stdout.flush()
+            
+            print()
+            logger.info("Recording complete!")
+            
+            # Save Waveform Plot
+            waveform_path = os.path.join(current_run_dir, "audio_waveform.png")
+            plot_audio_waveform(np.array(audio_data), 16000, waveform_path)
+            
+            return filename
+            
+    except Exception as e:
+        logger.error(f"Recording error: {e}")
+        return None
+    finally:
+        ser.close()
+
+def predict_audio(file_path: str) -> Tuple[Optional[str], Optional[float]]:
+    try:
+        model = tf.keras.models.load_model(AUDIO_MODEL_PATH)
+    except Exception as e:
+        logger.error(f"Load audio model failed: {e}")
+        return None, None
+    
+    try:
+        audio = tf.io.read_file(file_path)
+        audio, sample_rate = tf.audio.decode_wav(audio, desired_channels=1)
+        audio = tf.squeeze(audio, axis=-1)
+        
+        target_length = 16000 * 4
+        current_length = tf.shape(audio)[0]
+        audio = audio[:target_length]
+        pad_length = tf.maximum(target_length - current_length, 0)
+        audio = tf.pad(audio, [[0, pad_length]])
+        
+        stfts = tf.signal.stft(audio, frame_length=1024, frame_step=512, fft_length=1024)
+        spectrogram = tf.abs(stfts)
+        
+        # Save Spectrogram Plot
+        spectrogram_path = os.path.join(current_run_dir, "spectrogram.png")
+        plot_spectrogram(spectrogram.numpy().T, spectrogram_path)
+        
+        mel_matrix = tf.signal.linear_to_mel_weight_matrix(
+            num_mel_bins=128, num_spectrogram_bins=513, sample_rate=16000,
+            lower_edge_hertz=80.0, upper_edge_hertz=7600.0)
+        
+        mel_spectrogram = tf.tensordot(spectrogram, mel_matrix, 1)
+        log_mel = tf.math.log(mel_spectrogram + 1e-6)
+        mean, variance = tf.nn.moments(log_mel, axes=0)
+        normalized = (log_mel - mean) / tf.sqrt(variance + 1e-6)
+        
+        input_tensor = tf.expand_dims(normalized, axis=0)
+        input_tensor = tf.expand_dims(input_tensor, axis=-1)
+        predictions = model.predict(input_tensor)
+        
+        predicted_idx = np.argmax(predictions)
+        predicted_class = AUDIO_CLASS_NAMES[predicted_idx]
+        confidence = np.max(predictions) * 100
+        
+        logger.info(f"Audio Pred: {predicted_class} ({confidence:.1f}%)")
+        
+        # Save Prob Plot
+        prob_path = os.path.join(current_run_dir, "audio_probabilities.png")
+        plot_class_probabilities(AUDIO_CLASS_NAMES, predictions[0]*100, "Audio Probabilities", prob_path)
+        
+        return predicted_class, confidence
+        
+    except Exception as e:
+        logger.error(f"Audio prediction failed: {str(e)}")
+        return None, None
+
+def capture_image(audio_class: Optional[str] = None, 
+                 audio_conf: Optional[float] = None,
+                 image_class: Optional[str] = None,
+                 image_conf: Optional[float] = None,
+                 final_result: Optional[str] = None) -> Optional[str]:
+    
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    filename = os.path.join(IMAGE_SAVE_DIR, f"photo_{timestamp}.jpg")
+    
+    for i in range(RETRY_TIMES):
+        try:
+            response = requests.get(f"http://{ESP32_IP}/capture", timeout=10)
+            if response.status_code == 200:
+                with open(filename, "wb") as f:
+                    f.write(response.content)
+                logger.info(f"Photo saved: {filename}")
+                
+                # Generate English Preview for TFT
+                img = Image.open(filename).convert('RGB')
+                
+                # Use Matplotlib to draw text
+                fig = plt.figure(figsize=(1.28, 1.28), dpi=100)
+                plt.subplots_adjust(left=0, right=1, top=0.85, bottom=0.15)
+                
+                plt.imshow(img)
+                plt.axis('off')
+                
+                text_lines = []
+                if final_result:
+                    text_lines.append(f"Result: {final_result}")
+                if audio_class and audio_conf:
+                    text_lines.append(f"Audio: {audio_class} ({audio_conf:.0f}%)")
+                if image_class and image_conf:
+                    text_lines.append(f"Image: {image_class} ({image_conf:.0f}%)")
+                
+                if text_lines:
+                    text_content = "\n".join(text_lines)
+                    plt.figtext(0.5, 0.1, text_content, ha='center', va='center',
+                              fontsize=6, color='white', linespacing=1.5,
+                              bbox=dict(facecolor='black', alpha=0.5, edgecolor='none', boxstyle='round,pad=0.5'))
+                
+                preview_path = os.path.join(current_run_dir, "image_preview.png")
+                plt.savefig(preview_path, dpi=100, bbox_inches='tight', pad_inches=0)
+                plt.close()
+                
+                # Force Resize
+                preview_img = Image.open(preview_path).resize((128, 128))
+                preview_img.save(preview_path)
+                
+                return filename
+            else:
+                logger.error(f"HTTP Error: {response.status_code}")
+        except Exception as e:
+            logger.error(f"Capture failed: {str(e)}")
+        time.sleep(1)
+    return None
+
+class ImageClassifier:
+    def __init__(self):
+        try:
+            self.model = load_model(IMAGE_MODEL_PATH)
+            logger.info("Image model loaded.")
+        except Exception as e:
+            logger.error(f"Load image model failed: {e}")
+            raise
+
+    def preprocess_image(self, img_path: str) -> Optional[np.ndarray]:
+        try:
+            img = Image.open(img_path).convert('RGB')
+            img = img.resize(IMG_SIZE[::-1])
+            img_array = kimage.img_to_array(img)
+            img_array = (img_array / 127.5) - 1.0
+            img_array = np.expand_dims(img_array, axis=0)
+            return img_array
+        except Exception as e:
+            logger.error(f"Preprocess failed: {str(e)}")
+            return None
+
+    def classify(self, img_path: str) -> Tuple[Optional[str], Optional[float]]:
+        try:
+            img_array = self.preprocess_image(img_path)
+            if img_array is None: return None, None
+                
+            predictions = self.model.predict(img_array)
+            predicted_idx = np.argmax(predictions)
+            predicted_class = CLASS_NAMES[predicted_idx]
+            confidence = np.max(predictions) * 100
+            
+            logger.info(f"Image Pred: {predicted_class} ({confidence:.1f}%)")
+            
+            # Save Prob Plot
+            prob_path = os.path.join(current_run_dir, "image_probabilities.png")
+            plot_class_probabilities(CLASS_NAMES, predictions[0]*100, "Image Probabilities", prob_path)
+            
+            # Save Result Plot (English)
+            img = Image.open(img_path)
+            plt.figure(figsize=(12, 6))
+            
+            plt.subplot(1, 2, 1)
+            plt.imshow(img)
+            plt.title(f"Original Image\nPred: {predicted_class} ({confidence:.1f}%)")
+            plt.axis('off')
+            
+            plt.subplot(1, 2, 2)
+            bars = plt.bar(CLASS_NAMES, predictions[0]*100)
+            plt.title('Class Probability Distribution')
+            plt.xlabel('Class')
+            plt.ylabel('Probability (%)')
+            plt.xticks(rotation=45)
+            plt.ylim(0, 100)
+            for bar in bars:
+                height = bar.get_height()
+                plt.text(bar.get_x() + bar.get_width()/2., height, f'{height:.1f}%', ha='center', va='bottom')
+            
+            result_path = os.path.join(current_run_dir, "image_result.png")
+            plt.savefig(result_path, dpi=300, bbox_inches='tight')
+            plt.close()
+            
+            return predicted_class, confidence
+            
+        except Exception as e:
+            logger.error(f"Classification failed: {str(e)}")
+            return None, None
+
+def combine_results(audio_class, audio_conf, image_class, image_conf):
+    if audio_class is None and image_class is None:
+        final_result = "Unknown"
+    elif audio_class is None:
+        final_result = image_class
+    elif image_class is None:
+        final_result = audio_class
+    else:
+        if audio_class == image_class:
+            final_result = audio_class
+        else:
+            audio_score = audio_conf * AUDIO_WEIGHT
+            image_score = image_conf * IMAGE_WEIGHT
+            if audio_score > image_score:
+                final_result = audio_class
+            else:
+                final_result = image_class
+    
+    dashboard_path = os.path.join(current_run_dir, "result_dashboard.png")
+    create_result_dashboard(audio_class, audio_conf, image_class, image_conf, final_result, dashboard_path)
+    return final_result
+
+# =====================
+# Main Function
+# =====================
+def main():
+    global current_run_dir
+    print("=" * 70)
+    print("Smart Guide System: Multimodal Recognition")
+    print("=" * 70)
+    
+    run_timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    current_run_dir = os.path.join(VISUALIZATION_DIR, f"Run_{run_timestamp}")
+    os.makedirs(current_run_dir, exist_ok=True)
+    
+    # Init TFT
+    tft_display = TFTDisplayController()
+    if not tft_display.connect():
+        print("Warning: TFT connect failed (Check logs).")
+    
+    # Init Classifier
+    image_classifier = None
+    try:
+        image_classifier = ImageClassifier()
+    except Exception as e:
+        print(f"Classifier init failed: {e}")
+    
+    try:
+        # 1. Audio
+        print("\n>>> Recording Audio...")
+        audio_file = record_audio()
+        audio_class, audio_conf = (None, None)
+        if audio_file:
+            print("\n>>> Analyzing Audio...")
+            audio_class, audio_conf = predict_audio(audio_file)
+        
+        # 2. Image Capture
+        print("\n>>> Capturing Initial Image...")
+        image_file = capture_image()
+        
+        # 3. Image Analysis
+        image_class, image_conf = (None, None)
+        if image_file and image_classifier:
+            print("\n>>> Analyzing Image...")
+            image_class, image_conf = image_classifier.classify(image_file)
+        
+        # 4. Fusion
+        print("\n>>> Fusing Results...")
+        final_result = combine_results(audio_class, audio_conf, image_class, image_conf)
+        
+        # 5. Final Capture with Overlay
+        print("\n>>> Generating Result Preview...")
+        final_image_file = capture_image(audio_class, audio_conf, image_class, image_conf, final_result)
+        
+        # 6. Send to TFT
+        if final_image_file and tft_display.serial_conn:
+            preview_path = os.path.join(current_run_dir, "image_preview.png")
+            print("\n>>> Sending to TFT...")
+            if tft_display.send_image(preview_path):
+                print("Image sent to TFT successfully.")
+            else:
+                print("Failed to send image to TFT.")
+        
+        print("\n" + "=" * 70)
+        print(f"Final Decision: {final_result}")
+        print("=" * 70)
+        
+    except KeyboardInterrupt:
+        print("\nStopped by user.")
+    except Exception as e:
+        print(f"\nRuntime Error: {str(e)}")
+        import traceback
+        traceback.print_exc()
+    finally:
+        if 'tft_display' in locals():
+            tft_display.close()
+
+if __name__ == "__main__":
+    main()
