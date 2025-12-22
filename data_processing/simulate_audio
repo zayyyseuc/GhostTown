@@ -1,0 +1,104 @@
+# -*- coding: utf-8 -*-
+import os
+import librosa
+import soundfile as sf
+import numpy as np
+from tqdm import tqdm
+
+# ================= 配置区 =================
+# 指向包含所有子文件夹的总目录
+SOURCE_TAU_PATH = r"E:/CityML/tau"
+
+# 目标数据集路径
+TARGET_DATASET_PATH = r"E:/CityML/dataset_sound"
+
+# 【映射表】
+
+CLASS_MAPPING = {
+    # === A类：城市空隙 (Ghost) ===
+    'airport': 'A1',         # 机场 -> A1 (模拟工地/烂尾楼的机械声)
+    'public_square': 'A1',   # 广场 -> A1 (模拟空旷区域的风声/回声) 
+    'park': 'A2',            # 公园 -> A2 (自然/荒野)
+    
+    # === B类：居住区域 (Sleeper) ===
+    'tram': 'B1',            # 电车 -> B1 (利用其持续低频底噪，模拟高层塔楼背景音)
+    'street_pedestrian': 'B2', # 步行街 -> B2 (低层社区/城中村，真实的生活人声) 
+    
+    # === C类：城市核心 (Active) ===
+    'metro_station': 'C1',   # 地铁站 -> C1 (利用密集人流/广播，模拟商业区繁忙感)
+                             
+    'street_traffic': 'C2'   # 街道交通 -> C2 (主干道/交通动脉) 
+}
+
+# 目标格式参数
+TARGET_SR = 16000
+TARGET_SUBTYPE = 'PCM_16'
+
+def process_and_transfer():
+    print("="*50)
+    print(f"源目录: {SOURCE_TAU_PATH}")
+    print(f"目标目录: {TARGET_DATASET_PATH}")
+    print("模式: 标准增强版 (集成新数据 street_pedestrian & street_traffic)")
+    print("="*50)
+
+    if not os.path.exists(SOURCE_TAU_PATH):
+        print(f"错误：找不到源文件夹 {SOURCE_TAU_PATH}")
+        return
+
+    # 1. 递归扫描
+    print("正在扫描所有子目录中的 .wav 文件...")
+    all_files = []
+    for root, dirs, files in os.walk(SOURCE_TAU_PATH):
+        for file in files:
+            if file.endswith('.wav'):
+                all_files.append(os.path.join(root, file))
+    
+    print(f"扫描完成！共找到 {len(all_files)} 个音频文件。")
+    
+    if len(all_files) == 0:
+        print("警告：没找到文件，请检查路径！")
+        return
+
+    # 2. 开始处理
+    success_count = 0
+    print("\n开始转换并分拣...")
+    
+    for source_file in tqdm(all_files, desc="进度"):
+        filename = os.path.basename(source_file)
+        # TAU文件名格式: airport-lisbon-xxx.wav，取第一个横杠前的单词
+        tau_class = filename.split('-')[0]
+        
+        # 检查文件是否在我们的映射表中
+        if tau_class in CLASS_MAPPING:
+            my_label = CLASS_MAPPING[tau_class]
+            
+            target_dir = os.path.join(TARGET_DATASET_PATH, f"{my_label}_samples", "audio")
+            os.makedirs(target_dir, exist_ok=True)
+            
+            try:
+                # 读取 + 重采样
+                y, sr = librosa.load(source_file, sr=TARGET_SR, mono=True)
+                
+                # 切片增强 (10秒变2个4秒)
+                if len(y) >= TARGET_SR * 4:
+                    # 片段1
+                    save_name1 = os.path.join(target_dir, f"1_{filename}")
+                    sf.write(save_name1, y[:TARGET_SR * 4], TARGET_SR, subtype=TARGET_SUBTYPE)
+                    success_count += 1
+                    
+                    # 片段2
+                    if len(y) > TARGET_SR * 9:
+                        save_name2 = os.path.join(target_dir, f"2_{filename}")
+                        sf.write(save_name2, y[TARGET_SR * 5 : TARGET_SR * 9], TARGET_SR, subtype=TARGET_SUBTYPE)
+                        success_count += 1
+                
+            except Exception as e:
+                continue
+
+    print("="*50)
+    print(f"全部完成！")
+    print(f"共生成 {success_count} 个训练样本。")
+    
+
+if __name__ == "__main__":
+    process_and_transfer()
