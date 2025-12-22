@@ -1,0 +1,221 @@
+# -*- coding: utf-8 -*-
+"""
+强化版图像分类系统（纯Keras版本）
+核心功能：基于双路径卷积神经网络的图像分类系统
+输入要求：统一尺寸的RGB图像
+系统组件：
+1. 图像预处理模块（尺寸调整+标准化）
+2. 数据管道构建模块（自动数据集划分+高效加载）
+3. 双路径卷积神经网络（局部/全局特征融合）
+4. 训练流程（包含早停、模型保存、CSV日志记录）
+"""
+
+# =====================
+# 基础库导入
+# =====================
+import os  # 提供操作系统相关功能，如文件路径操作
+import numpy as np  # 数值计算库，用于数组操作
+import tensorflow as tf  # 深度学习框架
+from keras import layers, Model, optimizers, callbacks  # Keras高层API组件
+import sys  # 系统相关功能
+import io  # 输入输出流操作
+from PIL import Image  # 图像处理库
+
+# 设置标准输出编码为UTF-8（解决中文编码问题）
+sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='UTF-8')
+sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='UTF-8')
+
+# =====================
+# 配置区（用户必须修改部分）
+# =====================
+DATASET_PATH = r"E:/CityML/dataset_opencv"  # 数据集根目录路径（需替换为实际路径）
+CLASS_NAMES = ['A1', 'A2', 'B1', 'B2', 'C1', 'C2']  # 分类标签列表（需与子目录前缀严格匹配）
+IMG_SIZE = (240, 320)  # 统一图像尺寸（高度，宽度）
+
+# =====================
+# 数据预处理模块
+# =====================
+def image_preprocess(file_path, label):
+    """图像预处理流水线（TensorFlow图模式） - 修正版"""
+    try:
+        # 阶段1：读取和解码
+        img = tf.io.read_file(file_path)
+        img = tf.image.decode_jpeg(img, channels=3)  # 输出是 uint8 [0, 255]
+        
+        # 阶段2：数据标准化 (归一化到 0-1)
+        # 【关键修改】必须放在 resize 之前！
+        # convert_image_dtype 看到输入是 uint8，会自动除以 255 转为 float32 [0, 1]
+        img = tf.image.convert_image_dtype(img, tf.float32) 
+        
+        # 阶段3：尺寸标准化
+        # resize 接收 float32 [0, 1]，输出依然是 float32 [0, 1]
+        img = tf.image.resize(img, IMG_SIZE, method='bilinear')
+        
+        # 阶段4：数据增强（训练时随机增强）
+        if tf.random.uniform(()) > 0.5:
+            img = tf.image.flip_left_right(img)
+        
+        # 阶段5：数值中心化
+        # 将 [0, 1] 映射到 [-1, 1]
+        img = (img - 0.5) * 2.0
+
+        return img, label
+
+    except Exception as e:
+        # 【保留部分】捕获坏图，防止训练崩溃
+        tf.print(f"处理失败: {file_path}, 错误: {str(e)}")
+        # 返回一个全黑的图片占位，保证 batch 维度对齐
+        return tf.zeros((*IMG_SIZE, 3), dtype=tf.float32), label
+
+# =====================
+# 数据管道构建
+# =====================
+def build_datasets(data_dir, batch_size=32):
+    """构建高效数据流水线"""
+    print(f"\n正在扫描数据集路径: {os.path.abspath(data_dir)}")
+
+    # 阶段1：文件收集
+    file_paths = []
+    labels = []
+    
+    for class_idx, class_name in enumerate(CLASS_NAMES):
+        class_dir = os.path.join(data_dir, f"{class_name}_samples")
+        if not os.path.exists(class_dir):
+            raise FileNotFoundError(f"目录不存在: {class_dir}")
+            
+        for root, _, files in os.walk(class_dir):
+            for file in files:
+                if file.lower().endswith(('.jpg', '.jpeg', '.png')):
+                    file_paths.append(os.path.join(root, file))
+                    labels.append(class_idx)
+
+    if len(file_paths) == 0:
+        raise FileNotFoundError("未找到任何图像文件,请检查路径和文件格式")
+
+    # 阶段2：数据随机化
+    indices = np.random.permutation(len(file_paths))
+    file_paths = np.array(file_paths)[indices]
+    labels = np.array(labels)[indices]
+
+    # 阶段3：数据集划分
+    split = int(0.8 * len(file_paths))
+    train_files = file_paths[:split]
+    train_labels = labels[:split]
+    val_files = file_paths[split:]
+    val_labels = labels[split:]
+
+    print(f"数据集统计:")
+    print(f"- 总样本数: {len(file_paths)}")
+    print(f"- 训练集: {len(train_files)}")
+    print(f"- 验证集: {len(val_files)}")
+
+    # 阶段4：Dataset流水线构建
+    def create_dataset(files, labels):
+        return tf.data.Dataset.from_tensor_slices((files, labels)) \
+            .map(image_preprocess, num_parallel_calls=tf.data.AUTOTUNE) \
+            .filter(lambda x,y: tf.reduce_sum(x) != 0.0)\
+            .batch(batch_size) \
+            .prefetch(tf.data.AUTOTUNE)
+
+    return create_dataset(train_files, train_labels), create_dataset(val_files, val_labels)
+
+# =====================
+# 神经网络模型
+# =====================
+def create_model(input_shape=(240, 320, 3)):
+    """构建双路径卷积神经网络"""
+    inputs = layers.Input(shape=input_shape)
+    
+    # 高频特征路径
+    high = layers.Conv2D(32, (3,3), padding='same', activation='relu')(inputs)
+    high = layers.MaxPool2D((2, 2))(high)
+    high = layers.Conv2D(64, (3,3), padding='same', activation='relu')(high)
+    high = layers.MaxPool2D((2, 2))(high)
+
+    # 低频特征路径
+    low = layers.Conv2D(32, (7,7), strides=2, padding='same', activation='relu')(inputs)
+    low = layers.Conv2D(64, (7,7), strides=2, padding='same', activation='relu')(low)
+    
+    # 特征融合
+    merged = layers.Concatenate(axis=-1)([high, low])
+    merged = layers.Conv2D(128, (3,3), activation='relu')(merged)
+    merged = layers.GlobalAvgPool2D()(merged)
+
+    outputs = layers.Dense(len(CLASS_NAMES), activation='softmax')(merged)
+    
+    return Model(inputs, outputs)
+
+# =====================
+# 训练流程
+# =====================
+def main():
+    """主训练流程"""
+    try:
+        # 阶段1：数据集初始化
+        print("\n====== 正在加载数据集 ======")
+        train_dataset, val_dataset = build_datasets(DATASET_PATH)
+
+        # 阶段2：模型构建
+        print("\n====== 正在构建模型 ======")
+        model = create_model()
+        model.compile(
+            optimizer=optimizers.Adam(learning_rate=0.001),
+            loss='sparse_categorical_crossentropy',
+            metrics=['accuracy']
+        )
+        model.summary()
+
+        # 阶段3：回调配置 (已修改：加入 CSV 记录和 Version 2 模型保存)
+        print("\n====== 配置回调函数 ======")
+        
+        # 定义文件名
+        checkpoint_path = 'best_image_model_v2.keras' # <--- 修改了名字，不覆盖旧的
+        log_path = 'training_log.csv'                 # <--- 新增日志文件
+        
+        callbacks_list = [
+            # 1. 早停机制：防止过拟合
+            callbacks.EarlyStopping(
+                patience=10, 
+                restore_best_weights=True
+            ),
+            
+            # 2. 模型保存：只保存目前为止最好的
+            callbacks.ModelCheckpoint(
+                filepath=checkpoint_path,
+                save_best_only=True,
+                monitor='val_accuracy',
+                mode='max',
+                verbose=1  # 设置为1，保存时会在屏幕提示
+            ),
+            
+            # 3. CSV日志记录：自动把 accuracy, loss 保存到 Excel 可读文件
+            callbacks.CSVLogger(
+                filename=log_path,
+                separator=',',
+                append=False # False 表示每次重新跑都会覆盖这个csv，如果想续写改成 True
+            )
+        ]
+
+        # 阶段4：模型训练
+        print(f"\n====== 开始训练 (日志将保存至 {log_path}) ======")
+        history = model.fit(
+            train_dataset,
+            validation_data=val_dataset,
+            epochs=100,
+            callbacks=callbacks_list,
+            verbose=2
+        )
+
+        # 阶段5：训练结果输出
+        print("\n====== 训练完成 ======")
+        print(f"最佳验证准确率: {max(history.history['val_accuracy']):.4f}")
+        print(f"训练数据已保存至: {os.path.abspath(log_path)}")
+        print(f"最佳模型已保存至: {os.path.abspath(checkpoint_path)}")
+
+    except Exception as e:
+        print("\n====== 发生错误 ======")
+        print(f"错误类型: {type(e).__name__}")
+        print(f"错误详情: {str(e)}")
+
+if __name__ == "__main__":
+    main()
