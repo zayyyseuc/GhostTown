@@ -1,0 +1,230 @@
+# -*- coding: utf-8 -*-
+"""
+Enhanced Audio Classification System (Keras Version)
+Core Function: Deep learning audio classification based on Mel-spectrogram features
+Input: 16-bit PCM WAV, 16000Hz
+"""
+
+# =====================
+# Import Libraries
+# =====================
+import os
+import numpy as np
+import tensorflow as tf
+from keras import layers, Model, optimizers, callbacks
+import sys
+import io
+
+# Set standard output encoding to UTF-8
+sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='UTF-8')
+sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='UTF-8')
+
+# =====================
+# Configuration
+# =====================
+DATASET_PATH = r"E:/CityML/dataset_sound"
+CLASS_NAMES = ['A1', 'A2', 'B1', 'B2', 'C1', 'C2']
+
+# =====================
+# Data Preprocessing
+# =====================
+def audio_preprocess(file_path, label):
+    """Audio preprocessing pipeline (TensorFlow graph mode)"""
+    try:
+        # Phase 1: Read and Decode
+        raw_audio = tf.io.read_file(file_path)
+        audio, sample_rate = tf.audio.decode_wav(raw_audio, desired_channels=1)
+        audio = tf.squeeze(audio, axis=-1)
+
+        # Phase 2: Length Standardization
+        target_length = 16000 * 4 # 4 seconds
+        current_length = tf.shape(audio)[0]
+        audio = audio[:target_length]
+        pad_length = tf.maximum(target_length - current_length, 0)
+        audio = tf.pad(audio, [[0, pad_length]])
+
+        # Phase 3: Spectrogram Conversion
+        stfts = tf.signal.stft(
+            audio, 
+            frame_length=1024,
+            frame_step=512,
+            fft_length=1024
+        )
+        spectrogram = tf.abs(stfts)
+
+        # Create Mel Filterbank
+        mel_matrix = tf.signal.linear_to_mel_weight_matrix(
+            num_mel_bins=128,
+            num_spectrogram_bins=513,
+            sample_rate=16000,
+            lower_edge_hertz=80.0,
+            upper_edge_hertz=7600.0
+        )
+
+        # Apply Mel Filterbank
+        mel_spectrogram = tf.tensordot(spectrogram, mel_matrix, 1)
+        log_mel = tf.math.log(mel_spectrogram + 1e-6)
+
+        # Phase 4: Standardization
+        mean, variance = tf.nn.moments(log_mel, axes=[0,1])
+        normalized = (log_mel - mean) / tf.sqrt(variance + 1e-6)
+
+        return normalized, label
+
+    except Exception as e:
+        tf.print(f"Processing failed: {file_path}, Error: {str(e)}")
+        return tf.zeros((124, 128), dtype=tf.float32), label
+
+# =====================
+# Dataset Pipeline
+# =====================
+def build_datasets(data_dir, batch_size=32):
+    """Build efficient data pipeline"""
+    print(f"\nScanning dataset path: {os.path.abspath(data_dir)}")
+
+    # Phase 1: File Collection
+    file_paths = []
+    labels = []
+    
+    for class_idx, class_name in enumerate(CLASS_NAMES):
+        class_dir = os.path.join(data_dir, f"{class_name}_samples")
+        if not os.path.exists(class_dir):
+            raise FileNotFoundError(f"Directory not found: {class_dir}")
+            
+        for root, _, files in os.walk(class_dir):
+            for file in files:
+                if file.lower().endswith('.wav'):
+                    file_paths.append(os.path.join(root, file))
+                    labels.append(class_idx)
+
+    if len(file_paths) == 0:
+        raise FileNotFoundError("No WAV files found.")
+
+    # Phase 2: Randomization
+    indices = np.random.permutation(len(file_paths))
+    file_paths = np.array(file_paths)[indices]
+    labels = np.array(labels)[indices]
+
+    # Phase 3: Split
+    split = int(0.8 * len(file_paths))
+    train_files = file_paths[:split]
+    train_labels = labels[:split]
+    val_files = file_paths[split:]
+    val_labels = labels[split:]
+
+    print(f"Dataset Statistics:")
+    print(f"- Total: {len(file_paths)}")
+    print(f"- Train: {len(train_files)}")
+    print(f"- Val: {len(val_files)}")
+
+    # Phase 4: Create Dataset Object
+    def create_dataset(files, labels):
+        return tf.data.Dataset.from_tensor_slices((files, labels)) \
+            .map(audio_preprocess, num_parallel_calls=tf.data.AUTOTUNE) \
+            .filter(lambda x,y: tf.reduce_sum(x) != 0.0)\
+            .batch(batch_size) \
+            .prefetch(tf.data.AUTOTUNE)
+
+    return create_dataset(train_files, train_labels), create_dataset(val_files, val_labels)
+
+# =====================
+# Model Architecture
+# =====================
+def create_model(input_shape=(124, 128)):
+    """Build Dual-Path CNN"""
+    inputs = layers.Input(shape=input_shape)
+    
+    x = layers.Reshape(input_shape + (1,))(inputs)
+    
+    # High Frequency Path
+    high = layers.Conv2D(32, (3,3), padding='same', activation='relu')(x)
+    high = layers.MaxPool2D((2, 2))(high)
+
+    # Low Frequency Path
+    low = layers.Conv2D(32, (5,5), padding='same', activation='relu')(x)
+    low = layers.MaxPool2D((2, 4))(low)
+    low = layers.UpSampling2D((1, 2))(low)
+
+    # Fusion
+    merged = layers.Concatenate(axis=-1)([high, low])
+    merged = layers.Conv2D(64, (3,3), activation='relu')(merged)
+    merged = layers.GlobalAvgPool2D()(merged)
+
+    outputs = layers.Dense(len(CLASS_NAMES), activation='softmax')(merged)
+    
+    model = Model(inputs, outputs)
+    return model
+
+# =====================
+# Main Training Loop
+# =====================
+def main():
+    try:
+        # Phase 1: Load Data
+        print("\n====== Loading Dataset ======")
+        train_dataset, val_dataset = build_datasets(DATASET_PATH)
+
+        # Phase 2: Build Model
+        print("\n====== Building Model ======")
+        model = create_model()
+        model.compile(
+            optimizer=optimizers.Adam(learning_rate=0.001),
+            loss='sparse_categorical_crossentropy',
+            metrics=['accuracy']
+        )
+        model.summary()
+
+        # Phase 3: Configure Callbacks (Updated)
+        print("\n====== Configuring Callbacks ======")
+        
+        # Define file names
+        checkpoint_path = 'best_audio_model.keras'
+        log_path = 'audio_training_log.csv'  # New log file
+        
+        callbacks_list = [
+            # 1. Early Stopping
+            callbacks.EarlyStopping(
+                patience=10, 
+                restore_best_weights=True
+            ),
+            
+            # 2. Model Checkpoint
+            callbacks.ModelCheckpoint(
+                filepath=checkpoint_path,
+                save_best_only=True,
+                monitor='val_accuracy',
+                mode='max',
+                verbose=1
+            ),
+            
+            # 3. CSV Logger (Added)
+            callbacks.CSVLogger(
+                filename=log_path,
+                separator=',',
+                append=False
+            )
+        ]
+
+        # Phase 4: Training
+        print(f"\n====== Starting Training (Log saved to {log_path}) ======")
+        history = model.fit(
+            train_dataset,
+            validation_data=val_dataset,
+            epochs=100,
+            callbacks=callbacks_list,
+            verbose=2
+        )
+
+        # Phase 5: Output Results
+        print("\n====== Training Completed ======")
+        print(f"Best Validation Accuracy: {max(history.history['val_accuracy']):.4f}")
+        print(f"Training log saved to: {os.path.abspath(log_path)}")
+        print(f"Best model saved to: {os.path.abspath(checkpoint_path)}")
+
+    except Exception as e:
+        print("\n====== Error Occurred ======")
+        print(f"Type: {type(e).__name__}")
+        print(f"Detail: {str(e)}")
+
+if __name__ == "__main__":
+    main()
