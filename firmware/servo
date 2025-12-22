@@ -1,0 +1,84 @@
+#include <Adafruit_GFX.h>
+#include <Adafruit_ST7735.h>
+#include <Servo.h>
+
+#define TFT_CS   10
+#define TFT_RST   8 
+#define TFT_DC    9
+#define TFT_SCLK 13
+#define TFT_MOSI 11
+#define SERVO_PIN 7     // 舵机控制引脚
+#define BUTTON_PIN 2    // 按钮引脚（使用内部上拉电阻）
+
+Adafruit_ST7735 tft = Adafruit_ST7735(TFT_CS, TFT_DC, TFT_RST);
+Servo mg90s;           // 创建舵机对象
+
+// 舵机角度常量
+const int DEFAULT_ANGLE = 0;
+const int PRESSED_ANGLE = 180;
+
+// 按钮状态管理
+bool buttonWasPressed = false;
+bool servoExtended = false;  // 跟踪舵机位置状态
+
+void setup() {
+  Serial.begin(115200);
+  while(!Serial);
+  
+  tft.initR(INITR_144GREENTAB);
+  tft.fillScreen(ST7735_BLACK);
+  
+  // 配置按钮引脚（启用内部上拉电阻）
+  pinMode(BUTTON_PIN, INPUT_PULLUP);
+  
+  // 连接舵机并设置默认角度
+  mg90s.attach(SERVO_PIN);
+  mg90s.write(DEFAULT_ANGLE);
+  
+  Serial.println("TFT_READY");
+}
+
+void loop() {
+  // 处理舵机控制
+  handleServoControl();
+  
+  // 处理串口图像数据（原功能保持不变）
+  if(Serial.available() > 0) {
+    if(Serial.read() == 0xFF) {
+      tft.startWrite();
+      for(int y=0; y<128; y++) {
+        for(int x=0; x<128; x++) { 
+          while(Serial.available() < 2); // 等待数据
+          uint16_t color = (Serial.read() << 8) | Serial.read();
+          tft.writePixel(x, y, color);
+        }
+      }
+      tft.endWrite();
+      
+      // 明确发送确认
+      Serial.println("TFT_OK");
+    }
+  }
+}
+
+void handleServoControl() {
+  // 读取按钮状态（按下时为LOW）
+  bool buttonIsPressed = (digitalRead(BUTTON_PIN) == LOW);
+  
+  // 检测按钮按下动作（下降沿检测）
+  if (buttonIsPressed && !buttonWasPressed) {
+    // 切换到相反的位置
+    if(servoExtended) {
+      mg90s.write(DEFAULT_ANGLE);   // 回到90°
+      servoExtended = false;
+    } else {
+      mg90s.write(PRESSED_ANGLE);   // 旋转到180°
+      servoExtended = true;
+    }
+    
+    delay(50); // 简单防抖，防止连续触发
+  }
+  
+  // 更新按钮状态
+  buttonWasPressed = buttonIsPressed;
+}
