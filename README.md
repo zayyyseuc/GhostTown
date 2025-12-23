@@ -1,7 +1,5 @@
 # Urban Mirage: Multimodal Perception System for Ghost City Detection
 
-**"This place looks like a city, but it is not a city at all."**
-
 ## 1. Installation and Requirements
 
 Before running the system, please ensure the firmware is correctly uploaded to the microcontrollers and the host software environment is set up.
